@@ -1,2 +1,2 @@
 # isp568
-fuzzy
+fuzzy student performance evaluation integrating LLM with RAG using ReactJS and Fastapi
