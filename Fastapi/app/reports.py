@@ -5,9 +5,10 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 )
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from reportlab.lib.units import inch
 
 
 def generate_student_report_pdf(
@@ -38,10 +39,10 @@ def generate_student_report_pdf(
 
     styles.add(ParagraphStyle(
         name='TitleCenter',
-        fontSize=18,
-        leading=22,
+        fontSize=13,          # ⬇ smaller
+        leading=16,
         alignment=TA_CENTER,
-        spaceAfter=10,
+        spaceAfter=6,
         fontName='Helvetica-Bold',
         textColor=TEXT_GREEN
     ))
@@ -63,6 +64,15 @@ def generate_student_report_pdf(
     ))
 
     styles.add(ParagraphStyle(
+        name='Justified',
+        fontSize=10,
+        leading=14,
+        alignment=TA_JUSTIFY,
+        textColor=TEXT_GREEN,
+        firstLineIndent=20    # ✅ tab space
+    ))
+
+    styles.add(ParagraphStyle(
         name='SmallCenter',
         fontSize=9,
         alignment=TA_CENTER,
@@ -71,24 +81,25 @@ def generate_student_report_pdf(
 
     story: List[Any] = []
 
-    # ================= HEADER =================
-    header = Table([
-        [
-            Paragraph(
-                "COLLEGE OF COMPUTING, INFORMATICS AND MATHEMATICS<br/><br/>"
-                "BACHELOR OF INFORMATION SYSTEMS (HONS.) INTELLIGENT SYSTEMS ENGINEERING",
-                styles['TitleCenter']
-            ),
-        ]
-    ], colWidths=[430, 120])
+    # ================= LOGO =================
+    logo = Image(
+        "UiTM_Universiti_Teknologi_MARA_logo.png",
+        width=2.6 * inch,
+        height=1.2 * inch
+    )
+    logo.hAlign = 'CENTER'
+    story.append(logo)
+    story.append(Spacer(1, 8))
 
-    header.setStyle(TableStyle([
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-    ]))
+    # ================= HEADER TEXT =================
+    story.append(Paragraph(
+        "COLLEGE OF COMPUTING, INFORMATICS AND MATHEMATICS<br/>"
+        "BACHELOR OF INFORMATION SYSTEMS (HONS.)<br/>"
+        "INTELLIGENT SYSTEMS ENGINEERING",
+        styles['TitleCenter']
+    ))
 
-    story.append(header)
     story.append(Spacer(1, 6))
-
     story.append(Paragraph(
         f"Report Date: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         styles['SmallCenter']
@@ -144,7 +155,7 @@ def generate_student_report_pdf(
     # ================= AI SUGGESTION =================
     suggestion_table = Table([
         ["Academic Advisor's Suggestion"],
-        [Paragraph(suggestion.replace('\n', '<br/>'), styles['NormalLeft'])]
+        [Paragraph(suggestion.replace('\n', '<br/>'), styles['Justified'])]
     ], colWidths=[520])
 
     suggestion_table.setStyle(TableStyle([
@@ -159,12 +170,7 @@ def generate_student_report_pdf(
     story.append(suggestion_table)
     story.append(Spacer(1, 20))
 
-    # ================= FOOTER =================
-    story.append(Paragraph(
-        "Note: This evaluation is based on fuzzy logic analysis and AI-generated academic suggestions.",
-        styles['SmallCenter']
-    ))
-
+    # ================= BUILD =================
     doc.build(story)
     buffer.seek(0)
     return buffer
