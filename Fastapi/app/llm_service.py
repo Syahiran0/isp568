@@ -1,9 +1,17 @@
 from openai import OpenAI
 from typing import Optional, Dict, List
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_ollama import OllamaEmbeddings
 
 # --- IMPORTANT: Ollama Configuration ---
 OLLAMA_BASE_URL = "http://localhost:11434/v1" 
 OLLAMA_MODEL_NAME = "gemma3:1b"                 # Specify the model you have running in Ollama
+CHROMA_PATH = "./chroma_db"
+
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+vector_db = Chroma(persist_directory="./my_knowledge_base", embedding_function=embeddings)
 
 LLM_CLIENT: Optional[OpenAI] = None
 
@@ -76,30 +84,40 @@ def get_ai_suggestion(inputs: Dict, level: str, score: float) -> str:
         return f"Error: Missing input key {e}"
 
 
-# MODIFIED: Changed parameter name from 'current_question' to 'question'
 def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict]) -> str:
-    """Generates a chat response from the lecturer persona, including conversation history."""
-    
+    # 1. Try to get context
+    try:
+        docs = vector_db.similarity_search(question, k=3)
+        context_text = "\n\n".join([doc.page_content for doc in docs])
+    except Exception:
+        # If the database is empty or missing, provide empty context
+        context_text = "No specific academic documents are currently available."
+
+    # 2. Build the prompt
+    # If context_text is empty, the Professor will rely on his 'Lecturer' persona
     system_prompt_content = (
         f"You are Professor Syahiran, a knowledgeable and strict lecturer. "
-        f"Your sole focus is on providing advice and answering questions related to **student evaluation, performance, and academic improvement**. "
-        f"The student's current performance level is **{performance_level}**. "
-        f"Answer the user's question directly and concisely, using a maximum of 3-4 short sentences. "
-        f"**Do not use any markdown formatting (like bolding, or headers) in your final response.** "
-        f"You can use list formatting if necessary for clarity like give student steps to improve. "
-        f"If the user asks a question unrelated to academics, evaluation, or study habits, you must firmly but politely refuse, stating: "
-        f"'I am Professor Syahiran, and I can only assist with questions regarding your academic evaluation and performance improvement.'"
+        f"Student Performance: {performance_level}. "
+        f"Academic Context: {context_text if context_text else 'None available.'} "
+        f"Answer the question concisely in 3-4 sentences. "
+        f"If no context is provided, answer based on general academic best practices."
     )
     
-    # 1. Initialize the message list with the system prompt
     messages = [{"role": "system", "content": system_prompt_content}]
-
-    # 2. Append the previous history messages
     messages.extend(history)
-
-    # 3. Append the current user question
-    # Renamed the internal variable to 'question'
     messages.append({"role": "user", "content": question}) 
     
-    # 4. Call the general response function with the full message list
     return generate_llm_response(messages)
+
+def process_documents(file_path: str):
+    """Parses PDF/Word and splits into chunks for the database."""
+    if file_path.endswith('.pdf'):
+        loader = PyPDFLoader(file_path)
+    elif file_path.endswith('.docx'):
+        loader = Docx2txtLoader(file_path)
+    else:
+        return []
+
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
+    return splitter.split_documents(docs)

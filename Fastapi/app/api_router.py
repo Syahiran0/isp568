@@ -1,16 +1,21 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+import os
+from fastapi import APIRouter, HTTPException, Depends,  UploadFile, File
+from ollama import embeddings
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
-import io
-import matplotlib.pyplot as plt
+from typing import Dict, Any, List
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
+import shutil
 import time
+from langchain_community.vectorstores import Chroma
+
+CHROMA_PATH = "./chroma_db"
+
 
 # --- Module Imports ---
 try:
     from fuzzy_system import evaluate_score, get_performance_level 
-    from llm_service import initialize_llm, get_ai_suggestion, get_lecturer_chat_response
+    from llm_service import initialize_llm, get_ai_suggestion, get_lecturer_chat_response  , process_documents, vector_db
     from reports import generate_student_report_pdf
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: Could not find supporting modules. Error: {e}")
@@ -139,7 +144,48 @@ async def chat_with_lecturer_endpoint(chat_data: ChatQuery):
         "answer": answer
     }
 
+@router.post("/upload-knowledge", tags=["LLM Lecturer"])
+async def upload_knowledge_document(file: UploadFile = File(...)):
+    """
+    Uploads a PDF or Word doc, splits it into chunks, 
+    and adds it to the ChromaDB vector store.
+    """
+    # 1. Ensure a temporary directory exists
+    upload_dir = "temp_uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, file.filename)
 
+    try:
+        # 2. Save the uploaded file to disk temporarily
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 3. Process the document into chunks
+        # This calls the function we created in the previous step
+        chunks = process_documents(file_path)
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Unsupported file format or empty file.")
+
+        # 4. Add to the Vector Database
+        # This creates the mathematical embeddings and saves them to ./chroma_db
+        vector_db.add_documents(chunks)
+
+        return {
+            "status": "success", 
+            "message": f"Document '{file.filename}' processed and added to memory.",
+            "chunks_added": len(chunks)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+    
+    finally:
+        # 5. Clean up: Delete the temp file after processing
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    
 @router.get("/report/download", tags=["Reports"])
 async def download_pdf_report(
     attendance: float, 
@@ -191,3 +237,22 @@ async def download_pdf_report(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate PDF report: {str(e)}")
+
+@router.post("/reset-memory", tags=["LLM Lecturer"])
+async def reset_all_knowledge():
+    global vector_db 
+    
+    try:
+        # 1. Delete the collection
+        vector_db.delete_collection()
+        print("Collection deleted.")
+    except Exception as e:
+        print(f"Collection already empty or error: {e}")
+    
+    # 2. MANDATORY: Re-create the collection so the variable is valid again
+    vector_db = Chroma(
+        persist_directory=CHROMA_PATH, 
+        embedding_function=embeddings
+    )
+    
+    return {"status": "success", "message": "Memory wiped. Professor is ready for new files or general questions."}

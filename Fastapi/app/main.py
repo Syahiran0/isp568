@@ -13,8 +13,8 @@ app.include_router(router)
 
 @app.on_event("startup")
 async def startup_event():
-    """Initializes the LLM on application startup."""
-
+    """Initializes the LLM on application startup."""uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 
     print("--- Starting up application and initializing LLM client... ---")
     initialize_llm()
@@ -33,4 +33,3 @@ app.add_middleware(
     allow_headers=["*"],
 )
 # uvicorn main:app --reload
-# amingay
