@@ -113,7 +113,7 @@ def generate_student_report_pdf(
         ["Test Score", f"{inputs['test_score']:.1f}%"],
         ["Assignment Score", f"{inputs['assignment_score']:.1f}%"],
         ["Ethics", f"{inputs.get('ethics', 0.0):.1f}%"],
-        ["Cognitive Skills", f"{inputs.get('cognitive', 0.0):.1f}%"],
+        ["Cognitive and Professionalism", f"{inputs.get('cognitive', 0.0):.1f}%"],
     ], colWidths=[260, 260])
 
     input_table.setStyle(TableStyle([
