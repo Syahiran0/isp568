@@ -78,24 +78,36 @@ def get_ai_suggestion(inputs: Dict, level: str, score: float) -> str:
     except KeyError as e:
         return f"Error: Missing input key {e}"
 
-def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict]) -> str:
-    # Retrieve context from vector DB
-    try:
-        docs = vector_db.similarity_search(question, k=5)
-        context_text = "\n\n".join([doc.page_content for doc in docs])
-    except Exception:
-        context_text = ""
+def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict], student_info: Optional[Dict] = None) -> str:
+    # 1. Retrieve context from vector DB
+    docs = vector_db.similarity_search(question, k=5)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
 
-    # Strict RAG system prompt
+    # 2. Include performance info only if question is related
+    performance_context = ""
+    keywords = ["performance", "score", "grade", "CLO", "attendance", "test", "assignment"]
+    if any(kw in question.lower() for kw in keywords) and student_info:
+        performance_context = (
+            f"Student Performance: Attendance {student_info['attendance']}%, "
+            f"Test {student_info['test_score']}%, "
+            f"Assignment {student_info['assignment_score']}%, "
+            f"Cognitive Skills {student_info['cognitive']}%, "
+            f"Ethics {student_info['ethics']}%. "
+            f"Overall Level: {performance_level}"
+        )
+
+    # 3. Build system prompt
     system_prompt_content = (
         "You are Professor Syahiran responding to student academic questions. "
-        "The Academic Context provided below is official and authoritative. "
-        "Rules: Use only the Academic Context for factual or administrative questions. "
-        "If a list, number, or fact is present, reproduce it exactly. "
-        "Do not add, remove, rephrase, or invent any information. "
-        "If information is missing, clearly state that it is not provided. "
-        "Respond in 1–3 sentences, plain text only. No lists, markdown, or roleplay. "
-        f"Academic Context:\n{context_text if context_text else 'None available.'}"
+        "Rules:\n"
+        "- Include student performance details only if relevant to the question.\n"
+        "- Use only the Academic Context for factual information.\n"
+        "- Do not invent or hallucinate.\n"
+        "- If information is missing, respond: "
+        "'The requested information is not available in the current Academic Context. "
+        "Please refer to official university resources.'\n"
+        f"Academic Context:\n{context_text if context_text else 'None available.'}\n"
+        f"{performance_context}"
     )
 
     messages = [{"role": "system", "content": system_prompt_content}]
@@ -103,6 +115,7 @@ def get_lecturer_chat_response(performance_level: str, question: str, history: L
     messages.append({"role": "user", "content": question})
 
     return generate_llm_response(messages)
+
 
 def process_documents(file_path: str):
     """Load and split PDF or Word documents into chunks."""
