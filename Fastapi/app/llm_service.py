@@ -15,43 +15,66 @@ vector_db = Chroma(persist_directory="./my_knowledge_base", embedding_function=e
 
 LLM_CLIENT: Optional[OpenAI] = None
 
-def initialize_llm():
-    """Initializes the Ollama client for Granite 2B."""
+def initialize_llm() -> Optional[OpenAI]:
+    """Initialize the Ollama LLM client safely."""
     global LLM_CLIENT
-    if LLM_CLIENT is None:
+    if LLM_CLIENT:
+        return LLM_CLIENT
+    try:
+        print(f"Connecting to Ollama server at: {OLLAMA_BASE_URL}")
+        client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        # Optional test call to verify connection
         try:
-            print(f"Connecting to Ollama server at: {OLLAMA_BASE_URL}")
-            LLM_CLIENT = OpenAI(
-                base_url=OLLAMA_BASE_URL,
-                api_key="ollama"
+            test_response = client.chat.completions.create(
+                model=OLLAMA_MODEL_NAME,
+                messages=[{"role": "system", "content": "Test connection"}],
+                max_tokens=5
             )
-            print(f"LLM client initialized. Target Model: {OLLAMA_MODEL_NAME}")
+            print("LLM test call successful.")
         except Exception as e:
-            print(f"ERROR: Failed to initialize LLM client: {e}")
-            LLM_CLIENT = None
+            print(f"Warning: LLM test call failed: {e}")
+        LLM_CLIENT = client
+        print(f"LLM client initialized. Target Model: {OLLAMA_MODEL_NAME}")
+    except Exception as e:
+        print(f"ERROR: Failed to initialize LLM client: {e}")
+        LLM_CLIENT = None
     return LLM_CLIENT
 
-def generate_llm_response(messages: List[Dict]) -> str:
-    """Generates a response from Granite 2B using the chat completion API."""
+
+def generate_llm_response(messages: List[Dict], temperature: float = 0.2, max_tokens: int = 1024) -> str:
+    """
+    Generate a response from Ollama Granite 2B.
+    Handles empty responses, format differences, and connection errors.
+    """
     client = initialize_llm()
     if client is None:
         return "LLM service not initialized. Ensure Ollama is running and the model is loaded."
-    
+
     try:
         response = client.chat.completions.create(
             model=OLLAMA_MODEL_NAME,
             messages=messages,
-            temperature=0.2,   # Lower temperature for factual output
-            max_tokens=1024
+            temperature=temperature,
+            max_tokens=max_tokens
         )
-        generated_content = response.choices[0].message.content.strip()
+
+        # Get the first choice safely
+        if hasattr(response, "choices") and response.choices:
+            choice = response.choices[0]
+            # choice.message is an object, use .content
+            generated_content = getattr(choice.message, "content", "").strip()
+        else:
+            generated_content = ""
+
         if not generated_content:
+            print(f"DEBUG: Empty LLM response received: {response}")
             return "The language model returned an empty response."
+
         return generated_content
+
     except Exception as e:
         print(f"LLM generation error: {e}")
         return f"Error communicating with Ollama '{OLLAMA_MODEL_NAME}': {e}"
-
 def get_ai_suggestion(inputs: Dict, level: str, score: float) -> str:
     try:
         context = (
@@ -79,11 +102,23 @@ def get_ai_suggestion(inputs: Dict, level: str, score: float) -> str:
         return f"Error: Missing input key {e}"
 
 def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict], student_info: Optional[Dict] = None) -> str:
-    # 1. Retrieve context from vector DB
-    docs = vector_db.similarity_search(question, k=5)
-    context_text = "\n\n".join([doc.page_content for doc in docs])
+    # --- 1. Retrieve top relevant context ---
+    docs = vector_db.similarity_search(question, k=10)  # increased k for better coverage
+    if not docs:
+        context_text = "None available."
+    else:
+        # Limit total length to prevent truncation (approx 3000 tokens)
+        context_chunks = []
+        total_length = 0
+        for doc in docs:
+            chunk_len = len(doc.page_content.split())
+            if total_length + chunk_len > 3000:
+                break
+            context_chunks.append(doc.page_content)
+            total_length += chunk_len
+        context_text = "\n\n".join(context_chunks)
 
-    # 2. Include performance info only if question is related
+    # --- 2. Include performance info if relevant ---
     performance_context = ""
     keywords = ["performance", "score", "grade", "CLO", "attendance", "test", "assignment"]
     if any(kw in question.lower() for kw in keywords) and student_info:
@@ -93,28 +128,28 @@ def get_lecturer_chat_response(performance_level: str, question: str, history: L
             f"Assignment {student_info['assignment_score']}%, "
             f"Cognitive Skills {student_info['cognitive']}%, "
             f"Ethics {student_info['ethics']}%. "
-            f"Overall Level: {performance_level}"
+            f"Overall Level: {performance_level}."
         )
 
-    # 3. Build system prompt
+    # --- 3. Build system prompt with explicit context rule ---
     system_prompt_content = (
-        "You are Professor Syahiran responding to student academic questions. "
-        "Rules:\n"
-        "- Include student performance details only if relevant to the question.\n"
-        "- Use only the Academic Context for factual information.\n"
-        "- Do not invent or hallucinate.\n"
-        "- If information is missing, respond: "
+        "You are Professor Syahiran, an Academic Mentor. "
+        "Answer student academic questions using ONLY the Academic Context provided. "
+        "Do not invent or guess. If the answer is not in the context, respond exactly: "
         "'The requested information is not available in the current Academic Context. "
-        "Please refer to official university resources.'\n"
-        f"Academic Context:\n{context_text if context_text else 'None available.'}\n"
-        f"{performance_context}"
+        "Please refer to official university resources.'\n\n"
+        f"Academic Context:\n{context_text}\n\n{performance_context}"
     )
 
+    # --- 4. Construct messages ---
     messages = [{"role": "system", "content": system_prompt_content}]
-    messages.extend(history)
+    # include only the last 3 interactions to avoid history overflow
+    messages.extend(history[-3:])
     messages.append({"role": "user", "content": question})
 
+    # --- 5. Generate response ---
     return generate_llm_response(messages)
+
 
 
 def process_documents(file_path: str):
