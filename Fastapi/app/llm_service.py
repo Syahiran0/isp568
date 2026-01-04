@@ -1,106 +1,131 @@
 from openai import OpenAI
 from typing import Optional, Dict, List
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings
 
-# --- IMPORTANT: Ollama Configuration ---
-OLLAMA_BASE_URL = "http://localhost:11434/v1" 
-OLLAMA_MODEL_NAME = "qwen3-vl:4b"                 # Specify the model you have running in Ollama
+# --- Ollama Configuration ---
+OLLAMA_BASE_URL = "http://localhost:11434/v1"
+OLLAMA_MODEL_NAME = "granite3-dense:2b"  # Updated model for fast RAG responses
+CHROMA_PATH = "./chroma_db"
+
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+vector_db = Chroma(persist_directory="./my_knowledge_base", embedding_function=embeddings)
 
 LLM_CLIENT: Optional[OpenAI] = None
 
 def initialize_llm():
-    """Initializes the OpenAI client pointing to the local Ollama server."""
+    """Initializes the Ollama client for Granite 2B."""
     global LLM_CLIENT
     if LLM_CLIENT is None:
         try:
-            print(f"Attempting to connect to Ollama server at: {OLLAMA_BASE_URL}")
+            print(f"Connecting to Ollama server at: {OLLAMA_BASE_URL}")
             LLM_CLIENT = OpenAI(
                 base_url=OLLAMA_BASE_URL,
-                api_key="ollama" 
+                api_key="ollama"
             )
             print(f"LLM client initialized. Target Model: {OLLAMA_MODEL_NAME}")
         except Exception as e:
-            print(f"ERROR: Failed to initialize OpenAI client for Ollama. Error: {e}")
+            print(f"ERROR: Failed to initialize LLM client: {e}")
             LLM_CLIENT = None
-            
     return LLM_CLIENT
 
 def generate_llm_response(messages: List[Dict]) -> str:
-    """
-    Generates a response from the LLM using the chat completion interface based on a list of messages.
-    """
+    """Generates a response from Granite 2B using the chat completion API."""
     client = initialize_llm()
     if client is None:
-        return "LLM service is not initialized. Please ensure Ollama is running and the model is loaded."
-
+        return "LLM service not initialized. Ensure Ollama is running and the model is loaded."
+    
     try:
         response = client.chat.completions.create(
             model=OLLAMA_MODEL_NAME,
-            messages=messages, # Pass the entire message list
-            temperature=0.7,
-            max_tokens=1024,
+            messages=messages,
+            temperature=0.2,   # Lower temperature for factual output
+            max_tokens=1024
         )
-        
         generated_content = response.choices[0].message.content.strip()
-        
         if not generated_content:
-            return "The language model failed to generate a suggestion. This can happen if the model's output is blank or too short."
-        
+            return "The language model returned an empty response."
         return generated_content
-        
     except Exception as e:
         print(f"LLM generation error: {e}")
-        return f"An error occurred while communicating with the local Ollama server. Check if the model '{OLLAMA_MODEL_NAME}' is running: {e}"
+        return f"Error communicating with Ollama '{OLLAMA_MODEL_NAME}': {e}"
 
 def get_ai_suggestion(inputs: Dict, level: str, score: float) -> str:
-    """Generates an academic suggestion based on the student's performance."""
-    context = (
-        f"The student received the following evaluation scores: "
-        f"Attendance: {inputs['attendance']}%, Test Score: {inputs['test_score']}%, "
-        f"Assignment Score: {inputs['assignment_score']}%. "
-        f"The calculated overall performance level is **{level}** (Score: {score}/100)."
-    )
-    
-    system_prompt = (
-        "You are a supportive and professional Academic Advisor focused on student success. "
-        "Your task is to analyze the provided student evaluation scores and performance level, and offer **a single, plain-text paragraph of** "
-        "concise, actionable, and encouraging suggestions for improvement or continued excellence. "
-        "Focus on how the student can adjust their attendance, test preparation, or assignment effort. **Do not use markdown formatting (like bolding, lists, or headers) in your final response.**"
-    )
-    
-    user_prompt = f"{context}\n\nBased on these details, please provide a constructive suggestion and an encouraging closing statement."
-    
-    # Structure messages for the API call (No history for this single-turn suggestion)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    
-    return generate_llm_response(messages)
+    try:
+        context = (
+            f"The student received the following evaluation scores: "
+            f"Attendance: {inputs['attendance']}%, "
+            f"Test Score: {inputs['test_score']}%, "
+            f"Assignment Score: {inputs['assignment_score']}%, "
+            f"Ethics: {inputs['ethics']}%, "
+            f"Cognitive Skills: {inputs['cognitive']}%. "
+            f"The calculated overall performance level is {level} "
+            f"(Fuzzy Score: {score}/100)."
+        )
+        system_prompt = (
+            "You are an Academic Mentor focused on holistic student development. "
+            "Review the student's evaluation, paying attention to ethics and cognitive skills. "
+            "Write one concise, encouraging paragraph explaining how improving the weakest metric can boost overall performance. "
+            "Use professional plain text only. No lists, headers, or markdown formatting."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": context}
+        ]
+        return generate_llm_response(messages)
+    except KeyError as e:
+        return f"Error: Missing input key {e}"
 
-# MODIFIED: Changed parameter name from 'current_question' to 'question'
-def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict]) -> str:
-    """Generates a chat response from the lecturer persona, including conversation history."""
-    
+def get_lecturer_chat_response(performance_level: str, question: str, history: List[Dict], student_info: Optional[Dict] = None) -> str:
+    # 1. Retrieve context from vector DB
+    docs = vector_db.similarity_search(question, k=5)
+    context_text = "\n\n".join([doc.page_content for doc in docs])
+
+    # 2. Include performance info only if question is related
+    performance_context = ""
+    keywords = ["performance", "score", "grade", "CLO", "attendance", "test", "assignment"]
+    if any(kw in question.lower() for kw in keywords) and student_info:
+        performance_context = (
+            f"Student Performance: Attendance {student_info['attendance']}%, "
+            f"Test {student_info['test_score']}%, "
+            f"Assignment {student_info['assignment_score']}%, "
+            f"Cognitive Skills {student_info['cognitive']}%, "
+            f"Ethics {student_info['ethics']}%. "
+            f"Overall Level: {performance_level}"
+        )
+
+    # 3. Build system prompt
     system_prompt_content = (
-        f"You are Professor Syahiran, a knowledgeable and strict lecturer. "
-        f"Your sole focus is on providing advice and answering questions related to **student evaluation, performance, and academic improvement**. "
-        f"The student's current performance level is **{performance_level}**. "
-        f"Answer the user's question directly and concisely, using a maximum of 3-4 short sentences. "
-        f"**Do not use any markdown formatting (like bolding, or headers) in your final response.** "
-        f"You can use list formatting if necessary for clarity like give student steps to improve. "
-        f"If the user asks a question unrelated to academics, evaluation, or study habits, you must firmly but politely refuse, stating: "
-        f"'I am Professor Syahiran, and I can only assist with questions regarding your academic evaluation and performance improvement.'"
+        "You are Professor Syahiran responding to student academic questions. "
+        "Rules:\n"
+        "- Include student performance details only if relevant to the question.\n"
+        "- Use only the Academic Context for factual information.\n"
+        "- Do not invent or hallucinate.\n"
+        "- If information is missing, respond: "
+        "'The requested information is not available in the current Academic Context. "
+        "Please refer to official university resources.'\n"
+        f"Academic Context:\n{context_text if context_text else 'None available.'}\n"
+        f"{performance_context}"
     )
-    
-    # 1. Initialize the message list with the system prompt
+
     messages = [{"role": "system", "content": system_prompt_content}]
-
-    # 2. Append the previous history messages
     messages.extend(history)
+    messages.append({"role": "user", "content": question})
 
-    # 3. Append the current user question
-    # Renamed the internal variable to 'question'
-    messages.append({"role": "user", "content": question}) 
-    
-    # 4. Call the general response function with the full message list
     return generate_llm_response(messages)
+
+
+def process_documents(file_path: str):
+    """Load and split PDF or Word documents into chunks."""
+    if file_path.endswith(".pdf"):
+        loader = PyPDFLoader(file_path)
+    elif file_path.endswith(".docx"):
+        loader = Docx2txtLoader(file_path)
+    else:
+        return []
+
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+    return splitter.split_documents(docs)

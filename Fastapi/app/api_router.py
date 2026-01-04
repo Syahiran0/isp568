@@ -1,16 +1,21 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+import os
+from fastapi import APIRouter, HTTPException, Depends,  UploadFile, File
+from ollama import embeddings
 from pydantic import BaseModel, Field
-from typing import Dict, Any, List, Optional
-import io
-import matplotlib.pyplot as plt
+from typing import Dict, Any, List
 from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
+import shutil
 import time
+from langchain_community.vectorstores import Chroma
+
+CHROMA_PATH = "./chroma_db"
+
 
 # --- Module Imports ---
 try:
     from fuzzy_system import evaluate_score, get_performance_level 
-    from llm_service import initialize_llm, get_ai_suggestion, get_lecturer_chat_response
+    from llm_service import initialize_llm, get_ai_suggestion, get_lecturer_chat_response  , process_documents, vector_db
     from reports import generate_student_report_pdf
 except ImportError as e:
     print(f"CRITICAL IMPORT ERROR: Could not find supporting modules. Error: {e}")
@@ -22,9 +27,11 @@ router = APIRouter(prefix="/api/v1")
 
 class EvaluationInput(BaseModel):
     """Input model for student scores."""
-    attendance: float = Field(..., ge=0, le=100, description="Attendance percentage (0-100).")
-    test_score: float = Field(..., ge=0, le=100, description="Test score percentage (0-100).")
-    assignment_score: float = Field(..., ge=0, le=100, description="Assignment score percentage (0-100).")
+    attendance: float = Field(..., ge=0, le=100, description="Attendance (0-100)")
+    test_score: float = Field(..., ge=0, le=100, description="Test Score (0-100)")
+    assignment_score: float = Field(..., ge=0, le=100, description="Assignment Score (0-100)")
+    ethics: float = Field(..., ge=0, le=100, description="Professionalism/Ethics (0-100)")
+    cognitive: float = Field(..., ge=0, le=100, description="Cognitive Ability (0-100)")
 
 class Message(BaseModel):
     """Single message in the conversation history."""
@@ -47,67 +54,68 @@ def check_llm_status():
 
 # --- Endpoint Implementations ---
 
+# --- /evaluate endpoint ---
 @router.post("/evaluate", response_model=Dict[str, Any], tags=["Evaluation"])
 async def evaluate_student(input_data: EvaluationInput):
     """
-    Calculates the student's overall performance using the Fuzzy Logic System.
+    Evaluate the student using fuzzy logic and return score, performance level, and triggered rules.
     """
     try:
-        inputs = input_data.model_dump()
-        
-        # 1. FUZZIFICATION: The crisp input scores (attendance, test, assignment) 
-        #    are mapped to the degree of membership in the fuzzy sets (Low, Medium, High).
-        
-        # 2. INFERENCE & AGGREGATION: The fuzzy rules are applied using AND/OR operators
-        #    to determine the output fuzzy shape (Weak, Average, Good, Excellent).
-        
-        # The evaluate_score function runs the fuzzy computation:
-        result = evaluate_score(inputs['attendance'], inputs['test_score'], inputs['assignment_score'])
+        data_dict = input_data.model_dump()
+        result = evaluate_score(data_dict)
 
-        # 3. DEFUZZIFICATION: The resulting output fuzzy shape is converted back 
-        #    into a single, crisp score (result['fuzzy_score']) using the Centroid 
-        #    method (default in skfuzzy).
-        
         return {
             "status": "success",
-            "inputs": inputs,
+            "inputs": data_dict,  # Keep original inputs for suggestion
             "fuzzy_score": result['fuzzy_score'],
             "performance_level": result['performance_level'],
-            "explanation": f"The student's performance has been evaluated as {result['performance_level']} with a fuzzy score of {result['fuzzy_score']} out of 100."
+            "rules_triggered": result['applied_rules']  # This contains IF...THEN rules
         }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- /suggestion endpoint ---
 @router.post("/suggestion", response_model=Dict[str, Any], dependencies=[Depends(check_llm_status)], tags=["LLM Advisor"])
 async def get_ai_suggestion_endpoint(input_data: EvaluationInput):
     """
-    Uses the local LLM (Ollama) to generate a personalized suggestion based on calculated fuzzy score.
+    Generates a personalized academic suggestion based on the student's fuzzy evaluation scores.
+    Uses a local LLM (Ollama) for generating suggestions.
     """
-    # 1. Calculate fuzzy result
-    evaluation_result = await evaluate_student(input_data)
-    level = evaluation_result['performance_level']
-    score = evaluation_result['fuzzy_score']
-    
-    # 2. Run synchronous LLM call in a threadpool to prevent blocking
-    suggestion = await run_in_threadpool(
-        get_ai_suggestion, 
-        evaluation_result['inputs'], 
-        level, 
-        score
-    )
-    
-    if suggestion.startswith("LLM service is not initialized") or suggestion.startswith("An error occurred"):
-        raise HTTPException(status_code=500, detail=suggestion)
+    try:
+        # 1. Directly use evaluate_score instead of calling the async endpoint
+        data_dict = input_data.model_dump()
+        evaluation_result = evaluate_score(data_dict)  # Returns dict with applied_rules and fuzzy_score
 
-    return {
-        "status": "success",
-        "performance_level": level,
-        "suggestion": suggestion
-    }
+        inputs = evaluation_result['inputs']
+        level = evaluation_result['performance_level']
+        score = evaluation_result['fuzzy_score']
+        active_rules = evaluation_result.get('applied_rules', [])
 
+        # 2. Generate AI suggestion in a threadpool to avoid blocking
+        suggestion = await run_in_threadpool(
+            get_ai_suggestion,
+            inputs,
+            level,
+            score
+        )
+
+        # 3. Check for LLM errors
+        if suggestion.startswith("LLM service is not initialized") or suggestion.startswith("An error occurred"):
+            raise HTTPException(status_code=500, detail=suggestion)
+
+        return {
+            "status": "success",
+            "fuzzy_score": score,
+            "performance_level": level,
+            "applied_rules": active_rules,  # includes IF…THEN logic
+            "suggestion": suggestion
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate suggestion: {str(e)}")
+
+    
 @router.post("/chat", response_model=Dict[str, Any], dependencies=[Depends(check_llm_status)], tags=["LLM Lecturer"])
 async def chat_with_lecturer_endpoint(chat_data: ChatQuery):
     """
@@ -136,43 +144,115 @@ async def chat_with_lecturer_endpoint(chat_data: ChatQuery):
         "answer": answer
     }
 
+@router.post("/upload-knowledge", tags=["LLM Lecturer"])
+async def upload_knowledge_document(file: UploadFile = File(...)):
+    """
+    Uploads a PDF or Word doc, splits it into chunks, 
+    and adds it to the ChromaDB vector store.
+    """
+    # 1. Ensure a temporary directory exists
+    upload_dir = "temp_uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, file.filename)
 
+    try:
+        # 2. Save the uploaded file to disk temporarily
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # 3. Process the document into chunks
+        # This calls the function we created in the previous step
+        chunks = process_documents(file_path)
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Unsupported file format or empty file.")
+
+        # 4. Add to the Vector Database
+        # This creates the mathematical embeddings and saves them to ./chroma_db
+        vector_db.add_documents(chunks)
+
+        return {
+            "status": "success", 
+            "message": f"Document '{file.filename}' processed and added to memory.",
+            "chunks_added": len(chunks)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")
+    
+    finally:
+        # 5. Clean up: Delete the temp file after processing
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    
 @router.get("/report/download", tags=["Reports"])
 async def download_pdf_report(
     attendance: float, 
     test_score: float, 
-    assignment_score: float
+    assignment_score: float,
+    ethics: float = 0.0,
+    cognitive: float = 0.0
 ):
     """
     Generates a PDF report for a student's evaluation, including the AI suggestion, and returns it for download.
     """
-    # Create input model for validation and internal use
-    input_data = EvaluationInput(
-        attendance=attendance, 
-        test_score=test_score, 
-        assignment_score=assignment_score
-    )
-    
-    # 1. Get Evaluation Data
-    evaluation = await evaluate_student(input_data)
-    
-    # 2. Get Suggestion Data (runs LLM call in a threadpool)
-    suggestion_response = await get_ai_suggestion_endpoint(input_data)
-    suggestion_text = suggestion_response['suggestion']
-    
-    # 3. Generate PDF (runs synchronous ReportLab logic in a threadpool)
-    pdf_buffer = await run_in_threadpool(
-        generate_student_report_pdf,
-        input_data.model_dump(),
-        evaluation,
-        suggestion_text
-    )
+    try:
+        # 1. Create input dictionary for fuzzy evaluation
+        input_data_dict = {
+            "attendance": attendance,
+            "test_score": test_score,
+            "assignment_score": assignment_score,
+            "ethics": ethics,
+            "cognitive": cognitive
+        }
 
-    # 4. Return the PDF file response
-    report_filename = f"student_report_{evaluation['performance_level']}_{int(time.time())}.pdf"
+        # 2. Evaluate student using fuzzy logic
+        evaluation_result = evaluate_score(input_data_dict)  # returns dict with applied_rules, fuzzy_score, etc.
 
-    return Response(
-        content=pdf_buffer.read(),
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={report_filename}"}
+        # 3. Generate AI suggestion (run in threadpool to avoid blocking)
+        suggestion_text = await run_in_threadpool(
+            get_ai_suggestion,
+            evaluation_result['inputs'],
+            evaluation_result['performance_level'],
+            evaluation_result['fuzzy_score']
+        )
+
+        # 4. Generate PDF report (also in threadpool)
+        pdf_buffer = await run_in_threadpool(
+            generate_student_report_pdf,
+            evaluation_result['inputs'],  # original input scores
+            evaluation_result,           # evaluation results including applied_rules
+            suggestion_text              # AI suggestion text
+        )
+
+        # 5. Return PDF as a downloadable file
+        report_filename = f"student_report_{evaluation_result['performance_level']}_{int(time.time())}.pdf"
+
+        return Response(
+            content=pdf_buffer.read(),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={report_filename}"}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF report: {str(e)}")
+
+@router.post("/reset-memory", tags=["LLM Lecturer"])
+async def reset_all_knowledge():
+    global vector_db 
+    
+    try:
+        # 1. Delete the collection
+        vector_db.delete_collection()
+        print("Collection deleted.")
+    except Exception as e:
+        print(f"Collection already empty or error: {e}")
+    
+    # 2. MANDATORY: Re-create the collection so the variable is valid again
+    vector_db = Chroma(
+        persist_directory=CHROMA_PATH, 
+        embedding_function=embeddings
     )
+    
+    return {"status": "success", "message": "Memory wiped. Professor is ready for new files or general questions."}
